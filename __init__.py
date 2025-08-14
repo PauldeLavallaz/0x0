@@ -1,24 +1,10 @@
 
-"""
-ComfyUI custom node: comfyui-asset-to-url-0x0
-Uploads IMAGE/AUDIO/FILE/BYTES to 0x0.st and returns a direct URL (STRING).
-"""
-
-import io
-import os
-import wave
-import requests
-import numpy as np
+import io, os, wave, base64, requests, numpy as np
 
 try:
     import torch
 except Exception:
     torch = None
-
-try:
-    from PIL import Image
-except Exception:
-    Image = None
 
 CATEGORY = "I/O → URL"
 
@@ -27,39 +13,14 @@ def _upload_bytes(filename: str, data: bytes) -> str:
     r.raise_for_status()
     return r.text.strip()
 
-def _is_audio_obj(obj):
-    return isinstance(obj, dict) and "samples" in obj and "sample_rate" in obj
-
 def _to_numpy(x):
     if torch is not None and isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
     return np.asarray(x)
 
-def _image_tensor_to_bytes(img, fmt="png", quality=95):
-    if Image is None:
-        raise RuntimeError("Pillow (PIL) is required for image encoding")
-    # Comfy IMAGE is torch.Tensor [B,H,W,C] or [H,W,C] in [0,1]
-    if torch is not None and isinstance(img, torch.Tensor):
-        t = img
-        if t.dim() == 4:
-            t = t[0]
-        arr = (t.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
-    else:
-        arr = (np.clip(img, 0, 1) * 255).astype(np.uint8)
-    from PIL import Image as PILImage
-    pil = PILImage.fromarray(arr)
-    bio = io.BytesIO()
-    if fmt.lower() == "png":
-        pil.save(bio, format="PNG")
-        filename = "image.png"
-    else:
-        pil.save(bio, format="JPEG", quality=int(quality))
-        filename = "image.jpg"
-    return filename, bio.getvalue()
-
 def _audio_to_wav_bytes(samples, sample_rate, filename="audio.wav"):
     arr = _to_numpy(samples)
-    if arr.ndim == 1:
+    if arr.ndim == 1:  # [T] -> [1,T]
         arr = arr[np.newaxis, :]
     channels = arr.shape[0]
     arr = np.clip(arr, -1.0, 1.0)
@@ -72,86 +33,103 @@ def _audio_to_wav_bytes(samples, sample_rate, filename="audio.wav"):
         wf.writeframes(pcm.tobytes(order="C"))
     return (filename if str(filename).strip() else "audio.wav"), bio.getvalue()
 
-class ImageToURL_0x0:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "format": (["png", "jpg"], {"default": "png"}),
-                "quality": ("INT", {"default": 95, "min": 1, "max": 100})
-            }
-        }
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "run"
-    CATEGORY = CATEGORY
-    def run(self, image, format="png", quality=95):
-        fname, data = _image_tensor_to_bytes(image, fmt=format, quality=quality)
-        return (_upload_bytes(fname, data),)
+def _maybe_get_path_from_dict(d):
+    for k in ["path","filepath","file","tmp_path","audio_path","local_path","audio_file","filename"]:
+        v = d.get(k)
+        if isinstance(v, str) and os.path.isfile(v):
+            return v
+    return None
+
+def _maybe_get_bytes_from_dict(d):
+    for k in ["bytes","data","content"]:
+        v = d.get(k)
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            return bytes(v)
+        if isinstance(v, str) and v.startswith("data:audio"):
+            # data URL -> bytes
+            b64 = v.split(",", 1)[-1]
+            try:
+                return base64.b64decode(b64)
+            except Exception:
+                pass
+    return None
+
+def _maybe_get_samples_sr_from_dict(d):
+    # common keys across toolchains
+    sample_keys = ["samples","waveform","audio","array","tensor"]
+    sr_keys = ["sample_rate","sr","rate","sampleRate"]
+    samples = None
+    sr = None
+    for k in sample_keys:
+        if k in d:
+            samples = d[k]
+            break
+    for k in sr_keys:
+        if k in d:
+            sr = d[k]
+            break
+    if samples is not None and sr is not None:
+        return samples, sr
+    return None, None
 
 class AudioToURL_0x0:
-    """
-    Accepts various AUDIO shapes produced in Comfy / Comfy Deploy:
-    - dict {'samples','sample_rate'}
-    - tuple/list (samples, sample_rate)
-    - STRING local path to audio file
-    - bytes/bytearray
-    """
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "audio": ("AUDIO",),
-                "filename": ("STRING", {"default": ""}),  # used if we need to encode or for raw bytes
+                "filename": ("STRING", {"default": ""}),
+                "debug": ("BOOLEAN", {"default": False})
             }
         }
     RETURN_TYPES = ("STRING",)
     FUNCTION = "run"
     CATEGORY = CATEGORY
-    def run(self, audio, filename=""):
-        # case 1: classic AUDIO dict
-        if _is_audio_obj(audio):
-            fname, data = _audio_to_wav_bytes(audio["samples"], audio["sample_rate"], filename or "audio.wav")
-            return (_upload_bytes(fname, data),)
-        # case 2: tuple/list (samples, sample_rate)
+
+    def run(self, audio, filename="", debug=False):
+        # dict-like inputs
+        if isinstance(audio, dict):
+            if debug:
+                print("[AudioToURL_0x0] dict keys:", list(audio.keys()))
+            # (1) direct samples+sr
+            samples, sr = _maybe_get_samples_sr_from_dict(audio)
+            if samples is not None:
+                fname, data = _audio_to_wav_bytes(samples, sr, filename or "audio.wav")
+                return (_upload_bytes(fname, data),)
+            # (2) embedded file path
+            p = _maybe_get_path_from_dict(audio)
+            if p:
+                with open(p, "rb") as f:
+                    payload = f.read()
+                base = os.path.basename(p)
+                return (_upload_bytes(base, payload),)
+            # (3) embedded raw bytes / data URL
+            b = _maybe_get_bytes_from_dict(audio)
+            if b:
+                fname = filename if filename.strip() else "audio.bin"
+                return (_upload_bytes(fname, b),)
+
+        # tuple/list -> (samples, sr)
         if isinstance(audio, (tuple, list)) and len(audio) == 2:
             samples, sr = audio
             fname, data = _audio_to_wav_bytes(samples, sr, filename or "audio.wav")
             return (_upload_bytes(fname, data),)
-        # case 3: a local file path (string)
+
+        # local path
         if isinstance(audio, str) and os.path.isfile(audio):
             with open(audio, "rb") as f:
                 payload = f.read()
-            base = os.path.basename(audio)  # keep original extension (mp3/m4a/wav)
+            base = os.path.basename(audio)
             return (_upload_bytes(base, payload),)
-        # case 4: raw bytes
+
+        # raw bytes
         if isinstance(audio, (bytes, bytearray, memoryview)):
-            fname = filename if str(filename).strip() else "audio.bin"
+            fname = filename if filename.strip() else "audio.bin"
             return (_upload_bytes(fname, bytes(audio)),)
-        raise RuntimeError("AudioToURL_0x0: unsupported AUDIO object. Pass dict{'samples','sample_rate'}, (samples,sr), local path STRING, or bytes.")
 
-class PathToURL_0x0:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {"path": ("STRING", {"forceInput": True})}}
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "run"
-    CATEGORY = CATEGORY
-    def run(self, path):
-        p = str(path)
-        if not os.path.isfile(p):
-            raise RuntimeError(f"Path does not exist or is not a file: {p}")
-        with open(p, "rb") as f:
-            data = f.read()
-        return (_upload_bytes(os.path.basename(p), data),)
+        # object with attributes (e.g., audio.samples, audio.sample_rate)
+        if hasattr(audio, "samples") and hasattr(audio, "sample_rate"):
+            fname, data = _audio_to_wav_bytes(getattr(audio, "samples"), getattr(audio, "sample_rate"), filename or "audio.wav")
+            return (_upload_bytes(fname, data),)
 
-NODE_CLASS_MAPPINGS = {
-    "ImageToURL_0x0": ImageToURL_0x0,
-    "AudioToURL_0x0": AudioToURL_0x0,
-    "PathToURL_0x0": PathToURL_0x0,
-}
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ImageToURL_0x0": "Image → URL (0x0.st)",
-    "AudioToURL_0x0": "Audio → URL (0x0.st)",
-    "PathToURL_0x0": "Path → URL (0x0.st)",
-}
+        raise RuntimeError("AudioToURL_0x0: unsupported AUDIO object. Enable 'debug' to print keys/shape.")

@@ -46,7 +46,6 @@ def _maybe_get_bytes_from_dict(d):
         if isinstance(v, (bytes, bytearray, memoryview)):
             return bytes(v)
         if isinstance(v, str) and v.startswith("data:audio"):
-            # data URL -> bytes
             b64 = v.split(",", 1)[-1]
             try:
                 return base64.b64decode(b64)
@@ -55,7 +54,6 @@ def _maybe_get_bytes_from_dict(d):
     return None
 
 def _maybe_get_samples_sr_from_dict(d):
-    # common keys across toolchains
     sample_keys = ["samples","waveform","audio","array","tensor"]
     sr_keys = ["sample_rate","sr","rate","sampleRate"]
     samples = None
@@ -87,6 +85,10 @@ class AudioToURL_0x0:
     CATEGORY = CATEGORY
 
     def run(self, audio, filename="", debug=False):
+        # 0) If it's already a remote URL, pass-through
+        if isinstance(audio, str) and (audio.startswith("http://") or audio.startswith("https://") or audio.startswith("s3://")):
+            return (audio,)
+
         # dict-like inputs
         if isinstance(audio, dict):
             if debug:
